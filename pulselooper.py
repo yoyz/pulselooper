@@ -74,6 +74,7 @@ class TempoClock:
         self.last_sig = None
         
         self.clock_comp_ms = 0  
+        self.interpolation_mode = "lofi"
         
         self.play_metronome = False
         self.metro_data = None
@@ -156,10 +157,11 @@ class TempoClock:
 
         frames_per_beat_f = SYSTEM_RATE * 60.0 / self.bpm
         
-        start_frame = self.global_frames
+        # Accumulate beats relative to the current speed
+        block_start_beat = self.exact_global_beat 
+        self.exact_global_beat += frame_count / frames_per_beat_f
         self.global_frames += frame_count
         
-        self.exact_global_beat = self.global_frames / frames_per_beat_f
         total_beats = int(self.exact_global_beat)
         
         self.absolute_beat = total_beats
@@ -200,17 +202,32 @@ class TempoClock:
                 recorded_bpm = buf.get("recorded_bpm", self.bpm)
                 rec_frames_per_beat = SYSTEM_RATE * 60.0 / recorded_bpm
                 
-                beats_elapsed = self.exact_global_beat - buf.get("sync_beat", 0.0)
+                beats_elapsed = block_start_beat - buf.get("sync_beat", 0.0)
                 ph_start_frames = beats_elapsed * rec_frames_per_beat
                 
                 offset_frames = int(SYSTEM_RATE * (buf.get("offset_ms", 0.0) / 1000.0))
                 ratio = self.bpm / recorded_bpm
                 
                 out_indices = np.arange(frame_count)
+                exact_indices = (ph_start_frames + offset_frames + out_indices * ratio) % length
                 
-                buf_indices = (ph_start_frames + offset_frames + out_indices * ratio).astype(int) % length
+                # Selectable Interpolation
+                if getattr(self, 'interpolation_mode', 'lofi') == "smooth":
+                    # Linear Interpolation
+                    idx_int = exact_indices.astype(int)
+                    idx_next = (idx_int + 1) % length
+                    
+                    frac = (exact_indices - idx_int).astype(np.float32).reshape(-1, 1)
+                    
+                    sample_int = data[idx_int]
+                    sample_next = data[idx_next]
+                    
+                    track_audio = (sample_int + (sample_next - sample_int) * frac) * effective_vol
+                else:
+                    # Lofi / Nearest Neighbor
+                    buf_indices = exact_indices.astype(int)
+                    track_audio = data[buf_indices] * effective_vol
                 
-                track_audio = data[buf_indices] * effective_vol
                 outdata += track_audio
                 
                 ph = (ph_start_frames + frame_count * ratio) % length
@@ -228,10 +245,12 @@ class TempoClock:
         if self.play_metronome and self.metro_data is not None:
             metro_len = len(self.metro_data)
             clock_delay_frames = int(SYSTEM_RATE * (self.clock_comp_ms / 1000.0))
-            shifted_start_frame = start_frame - clock_delay_frames
-            measure_start_beats = (shifted_start_frame // int(frames_per_beat_f)) % self.beats_per_measure
-            frame_within_beat = shifted_start_frame % int(frames_per_beat_f)
-            ph = int(measure_start_beats * frames_per_beat_f + frame_within_beat) % metro_len
+            
+            delayed_beat = block_start_beat - (clock_delay_frames / frames_per_beat_f)
+            if delayed_beat < 0: delayed_beat = 0
+            
+            measure_phase = delayed_beat % self.beats_per_measure
+            ph = int(measure_phase * frames_per_beat_f) % metro_len
             
             out_indices = np.arange(frame_count)
             metro_indices = (ph + out_indices) % metro_len
@@ -433,6 +452,8 @@ class AudioTool:
         self.clock.clock_comp_ms = global_cfg.get("clock_comp_ms", 0)
         self.clock.play_metronome = global_cfg.get("play_metronome", False)
         
+        self.clock.interpolation_mode = global_cfg.get("interpolation_mode", "lofi")
+        
         for b in self.buffers:
             if b["state"] in ["PLAYING", "STOPPED", "QUEUED_PLAY", "QUEUED_STOP"]:
                 self.clock._load_buffer(b["id"])
@@ -459,6 +480,8 @@ class AudioTool:
 
     def _save_config(self):
         data = {
+            "_comment_interpolation_mode": "Set 'interpolation_mode' to 'lofi' (crunchy retro) or 'smooth' (linear interpolation) for pitched playback.",
+            "interpolation_mode": getattr(self.clock, 'interpolation_mode', 'lofi'),
             "latency_comp_ms": self.latency_comp_ms,
             "clock_comp_ms": self.clock.clock_comp_ms,
             "play_metronome": self.clock.play_metronome,
