@@ -26,18 +26,21 @@ This application is designed for Linux systems running PulseAudio or PipeWire (w
 * `pyaudio`
 * `curses` (standard library in Linux)
 
-You can install the Python dependencies via pip:
+** Ubuntu system **
+* Requirement are : python3-pulsectl python3-pyaudio
+
+
+You can also install the Python dependencies via pip:
 ```bash
 pip install pulsectl numpy pyaudio
 Usage
 ```
 
-Run the script via Python. By default, it will save your project to /tmp/pulselooper/.
+Run pulselooper using Python3 and it will save your project to /tmp/pulselooper/.
 
 You can also specify a custom session directory:
 
 ```bash
-
 python3 pulselooper.py /path/to/mysong
 ```
 
