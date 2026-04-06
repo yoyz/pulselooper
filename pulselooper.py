@@ -73,7 +73,7 @@ class TempoClock:
         self.time_sig_string = "4/4"
         self.last_sig = None
         
-        self.clock_comp_ms = 0  
+        self.frames_per_buffer = 1024  # default, overwritten by AudioTool config  
         self.interpolation_mode = "lofi"
         
         self.play_metronome = False
@@ -95,7 +95,7 @@ class TempoClock:
             channels=2,
             rate=SYSTEM_RATE,
             output=True,
-            frames_per_buffer=1024, 
+            frames_per_buffer=self.frames_per_buffer,
             stream_callback=self._audio_callback
         )
 
@@ -146,38 +146,69 @@ class TempoClock:
                     self.playheads[buf_id] = 0.0 
             except: pass
 
+    def reconfigure_stream(self, frames_per_buffer: int):
+        """Stop the current audio stream, recreate the PyAudio instance with a new
+        ``frames_per_buffer`` size, and restart playback.
+        """
+        # Stop and close existing stream safely
+        if self.stream:
+            try:
+                self.stream.stop_stream()
+                self.stream.close()
+            except Exception:
+                pass
+        # Terminate the existing PyAudio instance
+        try:
+            self.pa.terminate()
+        except Exception:
+            pass
+        # Create a fresh PyAudio instance and open a new stream with the requested size
+        self.pa = pyaudio.PyAudio()
+        self.stream = self.pa.open(
+            format=pyaudio.paFloat32,
+            channels=2,
+            rate=SYSTEM_RATE,
+            output=True,
+            frames_per_buffer=frames_per_buffer,
+            stream_callback=self._audio_callback,
+        )
+        # Start the stream again
+        self.start()
+
     def _audio_callback(self, in_data, frame_count, time_info, status):
+        """Audio processing callback used by PyAudio."""
         outdata = np.zeros((frame_count, 2), dtype=np.float32)
-        
+
         if self.bpm != self.last_bpm or self.time_sig_string != self.last_sig:
             self._update_ticks()
-            
+
         if not self.global_playing:
             return (outdata.tobytes(), pyaudio.paContinue)
 
         frames_per_beat_f = SYSTEM_RATE * 60.0 / self.bpm
-        
+
         # Accumulate beats relative to the current speed
-        block_start_beat = self.exact_global_beat 
+        block_start_beat = self.exact_global_beat
         self.exact_global_beat += frame_count / frames_per_beat_f
         self.global_frames += frame_count
-        
+
         total_beats = int(self.exact_global_beat)
-        
+
         self.absolute_beat = total_beats
         self.current_beat = (total_beats % self.beats_per_measure) + 1
-        
+
         is_beat_trigger = (total_beats > self.last_total_beats)
         is_downbeat_trigger = (is_beat_trigger and self.current_beat == 1)
-        
+
         if is_beat_trigger:
             self.last_total_beats = total_beats
-            
+
         if is_downbeat_trigger:
             self.last_downbeat_val = float(total_beats)
             for buf in self.buffers:
                 if buf["state"] == "QUEUED_PLAY":
                     buf["state"] = "PLAYING"
+                    buf["offset_ms"] = buf.get("offset_target_ms", buf.get("offset_ms", 0.0))
                     self._load_buffer(buf["id"])
                     self.playheads[buf["id"]] = 0.0 
                 elif buf["state"] == "QUEUED_STOP":
@@ -205,28 +236,24 @@ class TempoClock:
                 beats_elapsed = block_start_beat - buf.get("sync_beat", 0.0)
                 ph_start_frames = beats_elapsed * rec_frames_per_beat
                 
+                # Gradual interpolation toward target offset (5% per callback)
+                target = buf.get("offset_target_ms", buf.get("offset_ms", 0.0))
+                cur = buf.get("offset_ms", 0.0)
+                if abs(target - cur) > 0.01:
+                    buf["offset_ms"] = cur + (target - cur) * 0.05
                 offset_frames = int(SYSTEM_RATE * (buf.get("offset_ms", 0.0) / 1000.0))
                 ratio = self.bpm / recorded_bpm
                 
                 out_indices = np.arange(frame_count)
                 exact_indices = (ph_start_frames + offset_frames + out_indices * ratio) % length
                 
-                # Selectable Interpolation
                 if getattr(self, 'interpolation_mode', 'lofi') == "smooth":
-                    # Linear Interpolation
                     idx_int = exact_indices.astype(int)
                     idx_next = (idx_int + 1) % length
-                    
                     frac = (exact_indices - idx_int).astype(np.float32).reshape(-1, 1)
-                    
-                    sample_int = data[idx_int]
-                    sample_next = data[idx_next]
-                    
-                    track_audio = (sample_int + (sample_next - sample_int) * frac) * effective_vol
+                    track_audio = (data[idx_int] + (data[idx_next] - data[idx_int]) * frac) * effective_vol
                 else:
-                    # Lofi / Nearest Neighbor
-                    buf_indices = exact_indices.astype(int)
-                    track_audio = data[buf_indices] * effective_vol
+                    track_audio = data[exact_indices.astype(int)] * effective_vol
                 
                 outdata += track_audio
                 
@@ -241,21 +268,18 @@ class TempoClock:
                         buf["peak"] = max(np.max(np.abs(track_audio)), buf.get("peak", 0)*0.7)
                     else:
                         buf["peak"] = buf.get("peak", 0)*0.7
-                    
+        
         if self.play_metronome and self.metro_data is not None:
             metro_len = len(self.metro_data)
             clock_delay_frames = int(SYSTEM_RATE * (self.clock_comp_ms / 1000.0))
-            
             delayed_beat = block_start_beat - (clock_delay_frames / frames_per_beat_f)
             if delayed_beat < 0: delayed_beat = 0
-            
             measure_phase = delayed_beat % self.beats_per_measure
             ph = int(measure_phase * frames_per_beat_f) % metro_len
-            
             out_indices = np.arange(frame_count)
             metro_indices = (ph + out_indices) % metro_len
             outdata += self.metro_data[metro_indices]
-            
+        
         return (outdata.tobytes(), pyaudio.paContinue)
 
 # ==========================================
@@ -428,7 +452,7 @@ class AudioTool:
             self.patterns.append({
                 "id": i + 1,
                 "name": f"Pattern {i+1:02d}",
-                "buffers": [{"id": j, "name": f"Buf {j:02d}", "state": "EMPTY", "length": 4, "vol": 1.0, "sync_beat": 0.0, "peak": 0.0, "recorded_bpm": 120, "offset_ms": 0.0, "playhead_ratio": 0.0, "muted": False, "soloed": False} for j in range(1, 33)]
+                "buffers": [{"id": j, "name": f"Buf {j:02d}", "state": "EMPTY", "length": 4, "vol": 1.0, "sync_beat": 0.0, "peak": 0.0, "recorded_bpm": 120, "offset_ms": 0.0, "offset_target_ms": 0.0, "playhead_ratio": 0.0, "muted": False, "soloed": False} for j in range(1, 33)]
             })
             
         global_cfg = self._load_config()
@@ -454,10 +478,13 @@ class AudioTool:
         
         self.clock.interpolation_mode = global_cfg.get("interpolation_mode", "lofi")
         
+        self.frames_per_buffer = global_cfg.get("frames_per_buffer", 1024)  # default 1024
+        self.offset_interp_factor = global_cfg.get("offset_interp_factor", 0.05)  # 5 % default
+        
         for b in self.buffers:
             if b["state"] in ["PLAYING", "STOPPED", "QUEUED_PLAY", "QUEUED_STOP"]:
                 self.clock._load_buffer(b["id"])
-
+        
         self.clock.start()
 
     def _switch_mode(self, new_mode):
@@ -1202,6 +1229,35 @@ class AudioTool:
                     elif self.dropdown["sel"] == 2:
                         self.theme_idx = (self.theme_idx + 1) % 4
                         self._apply_theme()
+                    elif self.dropdown["sel"] == 3:
+                        # Adjust frames per buffer (step 256, clamp 256‑4096)
+                        new_val = max(256, min(4096, self.frames_per_buffer + 256))
+                        if new_val != self.frames_per_buffer:
+                            self.frames_per_buffer = new_val
+                            # Use the new reconfigure_stream helper
+                            self.clock.reconfigure_stream(self.frames_per_buffer)
+                    elif self.dropdown["sel"] == 4:
+                        # Adjust offset interpolation factor (step 1 %)
+                        self.offset_interp_factor = min(0.5, round(self.offset_interp_factor + 0.01, 2))
+                    
+                elif key in [ord('h'), curses.KEY_LEFT]:
+                    if self.dropdown["sel"] == 0:
+                        self.latency_comp_ms = max(0, self.latency_comp_ms - int(accel_step))
+                    elif self.dropdown["sel"] == 1:
+                        self.clock.clock_comp_ms -= int(accel_step)
+                    elif self.dropdown["sel"] == 2:
+                        self.theme_idx = (self.theme_idx - 1) % 4
+                        self._apply_theme()
+                    elif self.dropdown["sel"] == 3:
+                        # Adjust frames per buffer (step 256, clamp 256‑4096)
+                        new_val = max(256, min(4096, self.frames_per_buffer - 256))
+                        if new_val != self.frames_per_buffer:
+                            self.frames_per_buffer = new_val
+                            self.clock.reconfigure_stream(self.frames_per_buffer)
+
+                    elif self.dropdown["sel"] == 4:
+                        # Decrease offset interpolation factor (step 1 %)
+                        self.offset_interp_factor = max(0.01, round(self.offset_interp_factor - 0.01, 2))
                 elif key in [ord('h'), curses.KEY_LEFT]:
                     if self.dropdown["sel"] == 0:
                         self.latency_comp_ms = max(0, self.latency_comp_ms - int(accel_step))
@@ -1214,7 +1270,9 @@ class AudioTool:
                 self.dropdown["options"] = [
                     f"Rec Latency Comp (Input):  {self.latency_comp_ms:03d} ms",
                     f"Clock Comp (Output Delay): {self.clock.clock_comp_ms:+04d} ms",
-                    f"UI Theme: {['Default', 'Tango', 'Zenburn', 'Classic'][self.theme_idx]}"
+                    f"UI Theme: {['Default', 'Tango', 'Zenburn', 'Classic'][self.theme_idx]}",
+                    f"Frames/Buffer: {self.frames_per_buffer}",
+                    f"Offset Interp %: {int(self.offset_interp_factor*100)}"
                 ]
                 if key in [curses.KEY_ENTER, 10, 13, ord('q'), 27]:
                     self.dropdown = None
@@ -1292,7 +1350,9 @@ class AudioTool:
                 "options": [
                     f"Rec Latency Comp (Input):  {self.latency_comp_ms:03d} ms",
                     f"Clock Comp (Output Delay): {self.clock.clock_comp_ms:+04d} ms",
-                    f"UI Theme: {['Default', 'Tango', 'Zenburn', 'Classic'][self.theme_idx]}"
+                    f"UI Theme: {['Default', 'Tango', 'Zenburn', 'Classic'][self.theme_idx]}",
+                    f"Frames/Buffer: {self.frames_per_buffer}",
+                    f"Offset Interp %: {int(self.offset_interp_factor*100)}"
                 ],
                 "sel": 0
             }
@@ -1383,10 +1443,10 @@ class AudioTool:
                 
             elif key in [ord('<'), ord(',')]:
                 buf = self.buffers[self.looper_index]
-                buf["offset_ms"] -= accel_step
+                buf["offset_target_ms"] = buf.get("offset_target_ms", buf.get("offset_ms", 0.0)) - accel_step
             elif key in [ord('>'), ord('.')]:
                 buf = self.buffers[self.looper_index]
-                buf["offset_ms"] += accel_step
+                buf["offset_target_ms"] = buf.get("offset_target_ms", buf.get("offset_ms", 0.0)) + accel_step
                 
             elif key == ord('r'):
                 self.text_input = {"type": "rename", "prompt": "Rename Buffer:", "val": self.buffers[self.looper_index]["name"]}
