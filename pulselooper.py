@@ -14,6 +14,8 @@ import json
 import shutil
 import copy
 
+__version__ = "1.0.0"
+
 # ==========================================
 # 1. SYSTEM INITIALIZATION & WORKSPACE
 # ==========================================
@@ -962,6 +964,8 @@ class AudioTool:
     def draw_ui(self, stdscr):
         stdscr.erase()
         h, w = stdscr.getmaxyx()
+
+        stdscr.addstr(0, w - len(__version__) - 9, f" Ver: {__version__} ", curses.color_pair(1) | curses.A_DIM)
         
         for i, name in enumerate([" F1: Output ", " F2: Input ", " F3: Cards ", " F4: Looper "]):
             attr = curses.color_pair(1) | curses.A_REVERSE if self.mode == i+1 else curses.A_NORMAL
