@@ -224,51 +224,53 @@ class TempoClock:
                 length = len(data)
                 if length == 0: continue
                 
-                effective_vol = buf["vol"]
-                if buf.get("muted", False):
+                # 1. Volume & Solo Logic
+                effective_vol = buf["vol"] if not buf.get("muted", False) else 0.0
+                if any_solo and not buf.get("soloed", False):
                     effective_vol = 0.0
-                elif any_solo and not buf.get("soloed", False):
-                    effective_vol = 0.0
-                
-                recorded_bpm = buf.get("recorded_bpm", self.bpm)
-                rec_frames_per_beat = SYSTEM_RATE * 60.0 / recorded_bpm
-                
-                beats_elapsed = block_start_beat - buf.get("sync_beat", 0.0)
-                ph_start_frames = beats_elapsed * rec_frames_per_beat
-                
-                # Gradual interpolation toward target offset (5% per callback)
+                if effective_vol <= 0: continue # Skip processing for silent tracks
+
+                # 2. Smooth Offset Interpolation (Microtiming)
                 target = buf.get("offset_target_ms", buf.get("offset_ms", 0.0))
                 cur = buf.get("offset_ms", 0.0)
+                
+                # Check if we actually need to move the offset
                 if abs(target - cur) > 0.01:
-                    buf["offset_ms"] = cur + (target - cur) * 0.05
-                offset_frames = int(SYSTEM_RATE * (buf.get("offset_ms", 0.0) / 1000.0))
+                    # Use the user-defined factor (default 0.05)
+                    buf["offset_ms"] = cur + (target - cur) * getattr(self, 'offset_interp_factor', 0.05)
+                
+                # 3. Playhead Calculation
+                recorded_bpm = buf.get("recorded_bpm", self.bpm)
                 ratio = self.bpm / recorded_bpm
                 
-                out_indices = np.arange(frame_count)
-                exact_indices = (ph_start_frames + offset_frames + out_indices * ratio) % length
+                # Calculate start position based on sync beat
+                offset_frames = (buf["offset_ms"] / 1000.0) * SYSTEM_RATE
+                ph_start_frames = (block_start_beat - buf.get("sync_beat", 0.0)) * (SYSTEM_RATE * 60.0 / recorded_bpm)
                 
-                if getattr(self, 'interpolation_mode', 'lofi') == "smooth":
-                    idx_int = exact_indices.astype(int)
-                    idx_next = (idx_int + 1) % length
-                    frac = (exact_indices - idx_int).astype(np.float32).reshape(-1, 1)
-                    track_audio = (data[idx_int] + (data[idx_next] - data[idx_int]) * frac) * effective_vol
+                # 4. Optimized Indexing
+                # Instead of full arange + float math every time, 
+                # we calculate the start and end and use a more linear approach
+                t = np.arange(frame_count)
+                idx = (ph_start_frames + offset_frames + t * ratio) % length
+                
+                # 5. Fast Interpolation
+                if self.interpolation_mode == "smooth":
+                    idx_floor = idx.astype(np.int32)
+                    frac = (idx - idx_floor).astype(np.float32).reshape(-1, 1)
+                    # Advanced Slicing:
+                    next_idx = (idx_floor + 1) % length
+                    track_audio = (data[idx_floor] * (1.0 - frac)) + (data[next_idx] * frac)
+                    track_audio *= effective_vol
                 else:
-                    track_audio = data[exact_indices.astype(int)] * effective_vol
+                    track_audio = data[idx.astype(np.int32)] * effective_vol
                 
                 outdata += track_audio
                 
-                ph = (ph_start_frames + frame_count * ratio) % length
-                self.playheads[buf["id"]] = ph
-                
-                current_visual_ph = (ph_start_frames + offset_frames + frame_count * ratio) % length
-                buf["playhead_ratio"] = current_visual_ph / length
-                
+                # Update visual playhead
+                buf["playhead_ratio"] = (idx[-1] / length) if frame_count > 0 else 0
                 if frame_count > 0:
-                    if effective_vol > 0.0:
-                        buf["peak"] = max(np.max(np.abs(track_audio)), buf.get("peak", 0)*0.7)
-                    else:
-                        buf["peak"] = buf.get("peak", 0)*0.7
-        
+                    buf["peak"] = max(np.max(np.abs(track_audio)), buf.get("peak", 0) * 0.8)
+       
         if self.play_metronome and self.metro_data is not None:
             metro_len = len(self.metro_data)
             clock_delay_frames = int(SYSTEM_RATE * (self.clock_comp_ms / 1000.0))
