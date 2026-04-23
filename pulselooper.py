@@ -78,6 +78,7 @@ class TempoClock:
         
         self.play_metronome = False
         self.metro_data = None
+        self.metro_vol = 0.5
         
         self.buffer_data = {}
         self.playheads = {}
@@ -119,10 +120,12 @@ class TempoClock:
         silence_frames = max(0, frames_per_beat - tick_frames)
         silence = np.zeros(silence_frames, dtype=np.float32)
         
-        audio_high = np.sin(1200 * t * 2 * np.pi) * envelope * 0.15 
+        #audio_high = np.sin(1200 * t * 2 * np.pi) * envelope * 0.15 
+        audio_high = np.sin(1200 * t * 2 * np.pi) * envelope * 0.5
         beat_high = np.concatenate((audio_high, silence)).astype(np.float32)
         
-        audio_low = np.sin(600 * t * 2 * np.pi) * envelope * 0.15 
+        #audio_low = np.sin(600 * t * 2 * np.pi) * envelope * 0.15 
+        audio_low = np.sin(600 * t * 2 * np.pi) * envelope * 0.5
         beat_low = np.concatenate((audio_low, silence)).astype(np.float32)
         
         beat_high_stereo = np.column_stack((beat_high, beat_high))
@@ -276,12 +279,16 @@ class TempoClock:
             clock_delay_frames = int(SYSTEM_RATE * (self.clock_comp_ms / 1000.0))
             delayed_beat = block_start_beat - (clock_delay_frames / frames_per_beat_f)
             if delayed_beat < 0: delayed_beat = 0
+            
             measure_phase = delayed_beat % self.beats_per_measure
             ph = int(measure_phase * frames_per_beat_f) % metro_len
+            
             out_indices = np.arange(frame_count)
             metro_indices = (ph + out_indices) % metro_len
-            outdata += self.metro_data[metro_indices]
-        
+            
+            # Use the new metro_vol here
+            outdata += self.metro_data[metro_indices] * self.metro_vol
+
         return (outdata.tobytes(), pyaudio.paContinue)
 
 # ==========================================
@@ -448,15 +455,44 @@ class AudioTool:
         self.key_press_start = 0.0
         
         # We start with default global definitions. 
-        # _load_session will fully override this if a project exists!
+        # Initialize Patterns with CLICK at index 0
         self.patterns = []
         for i in range(16):
+            # Create the 31 standard buffers
+            other_bufs = [{
+                "id": j, 
+                "name": f"Buf {j:02d}", 
+                "state": "EMPTY", 
+                "length": 4, 
+                "vol": 1.0, 
+                "sync_beat": 0.0, 
+                "peak": 0.0, 
+                "recorded_bpm": 120, 
+                "offset_ms": 0.0, 
+                "offset_target_ms": 0.0, 
+                "playhead_ratio": 0.0, 
+                "muted": False, 
+                "soloed": False
+            } for j in range(1, 32)]
+
+            # Prepend the CLICK buffer
+            click_buf = {
+                "id": 99, 
+                "name": "CLICK", 
+                "state": "METRO", 
+                "length": 4, 
+                "vol": 0.5, 
+                "peak": 0.0, 
+                "muted": False, 
+                "soloed": False
+            }
+            
             self.patterns.append({
                 "id": i + 1,
                 "name": f"Pattern {i+1:02d}",
-                "buffers": [{"id": j, "name": f"Buf {j:02d}", "state": "EMPTY", "length": 4, "vol": 1.0, "sync_beat": 0.0, "peak": 0.0, "recorded_bpm": 120, "offset_ms": 0.0, "offset_target_ms": 0.0, "playhead_ratio": 0.0, "muted": False, "soloed": False} for j in range(1, 33)]
+                "buffers": [click_buf] + other_bufs
             })
-            
+          
         global_cfg = self._load_config()
         self.latency_comp_ms = global_cfg.get("latency_comp_ms", 60)
         self.hidden_devices = set(global_cfg.get("hidden_devices", []))
@@ -543,6 +579,11 @@ class AudioTool:
                         if state != "EMPTY" and not os.path.exists(os.path.join(WORKSPACE_DIR, f"buffer_{lb['id']:02d}.raw")):
                             state = "EMPTY"
                         
+                        # Add this check: If it's ID 99, force the name to CLICK and state to METRO
+                        if lb["id"] == 99:
+                            lb["name"] = "CLICK"
+                            lb["state"] = "METRO"
+
                         p["buffers"].append({
                             "id": lb["id"],
                             "name": lb.get("name", f"Buf {lb['id']:02d}"),
@@ -1094,7 +1135,17 @@ class AudioTool:
 
     def _sync_states(self):
         for buf in self.buffers:
-            buf["peak"] = buf.get("peak", 0.0) * 0.85
+            if buf["id"] == 99:
+                # If metronome is playing, make the meter jump on the beat
+                if self.clock.play_metronome and self.clock.global_playing:
+                    # Brief spike on the beat
+                    beat_pos = self.clock.exact_global_beat % 1.0
+                    buf["peak"] = 0.8 if beat_pos < 0.1 else buf.get("peak", 0) * 0.5
+                else:
+                    buf["peak"] = 0.0
+            else:
+                buf["peak"] = buf.get("peak", 0.0) * 0.85
+
             
         for mon_key, m in self.monitors.items():
             if m.armed_buffer_id is not None:
@@ -1294,6 +1345,7 @@ class AudioTool:
                     elif sig == "8/4": self.clock.beats_per_measure = 8
                 self.dropdown = None
                 
+
             elif key in [curses.KEY_PPAGE, curses.KEY_NPAGE, ord('['), ord(']')]:
                 if self.dropdown["type"] == "buffer":
                     buf_idx = self.dropdown["sel"]
@@ -1383,6 +1435,18 @@ class AudioTool:
                     self.looper_index -= 1
                     self.target_buffer_index = self.looper_index
                     
+            elif key in [ord('l'), curses.KEY_RIGHT, ord('h'), curses.KEY_LEFT]:
+                buf = self.buffers[self.looper_index]
+                step = 0.05 if key in [ord('l'), curses.KEY_RIGHT] else -0.05
+                buf["vol"] = max(0.0, min(self.max_vol, buf["vol"] + step))
+                
+                # If this is the Click track, sync the value to the clock
+                if buf["id"] == 99:
+                    self.clock.metro_vol = buf["vol"]
+                    # Also toggle the metronome on if the volume is raised
+                    self.clock.play_metronome = (buf["vol"] > 0) and not buf.get("muted", False)
+
+
             elif key == ord('C'):
                 self.clipboard_buf = self.looper_index
                 self.status_msg = f"Copied Buf {self.buffers[self.looper_index]['id']:02d}"
@@ -1465,26 +1529,29 @@ class AudioTool:
                 
             elif key in [curses.KEY_BACKSPACE, curses.KEY_DC, 127, 8]:
                 buf = self.buffers[self.looper_index]
-                if buf["state"] not in ["RECORDING", "ARMED"]:
-                    # Global deletion logic
-                    target_id = buf["id"]
-                    reset_name = f"Buf {target_id:02d}"
-                    for p in self.patterns:
-                        for b in p["buffers"]:
-                            if b["id"] == target_id:
-                                b["state"] = "EMPTY"
-                                b["name"] = reset_name
-                                b["peak"] = 0.0
-                                b["offset_ms"] = 0.0
-                                b["sync_beat"] = 0.0
-                                b["muted"] = False
-                                b["soloed"] = False
-                                
-                    if target_id in self.clock.buffer_data:
-                        del self.clock.buffer_data[target_id]
-                    file_path = os.path.join(WORKSPACE_DIR, f"buffer_{target_id:02d}.raw")
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
+                
+                # Use a conditional check instead of 'continue'
+                if buf["id"] != 99: 
+                    if buf["state"] not in ["RECORDING", "ARMED"]:
+                        # Global deletion logic
+                        target_id = buf["id"]
+                        reset_name = f"Buf {target_id:02d}"
+                        for p in self.patterns:
+                            for b in p["buffers"]:
+                                if b["id"] == target_id:
+                                    b["state"] = "EMPTY"
+                                    b["name"] = reset_name
+                                    b["peak"] = 0.0
+                                    b["offset_ms"] = 0.0
+                                    b["sync_beat"] = 0.0
+                                    b["muted"] = False
+                                    b["soloed"] = False
+                                    
+                        if target_id in self.clock.buffer_data:
+                            del self.clock.buffer_data[target_id]
+                        file_path = os.path.join(WORKSPACE_DIR, f"buffer_{target_id:02d}.raw")
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
 
         # --- F3 CARDS KEYS ---
         elif self.mode == 3:
