@@ -14,8 +14,9 @@ import json
 import shutil
 import copy
 
-#__version__ = "1.0.0"  # first useable
-__version__ = "1.0.1"   # adding more timesignature, and remove the CLICK channel from session.json
+# "1.0.0"               # first useable
+# "1.0.1"               # adding more timesignature, and remove the CLICK channel from session.json
+__version__ = "1.0.2"   # fix a microtiming bug when changing pattern
 
 CLICK_BUFFER_ID = 99
 MAX_BUFFERS = 32
@@ -753,6 +754,10 @@ class AudioTool:
                 new_b["state"] = "QUEUED_PLAY"
             elif new_b["state"] in ["STOPPED", "EMPTY"] and old_b["state"] in ["PLAYING", "QUEUED_STOP"]:
                 new_b["state"] = "QUEUED_STOP"
+                if old_b["state"] == "PLAYING":
+                    new_b["recorded_bpm"] = old_b.get("recorded_bpm", self.clock.bpm)
+                    new_b["offset_ms"] = old_b.get("offset_ms", 0.0)
+                    new_b["offset_target_ms"] = old_b.get("offset_target_ms", old_b.get("offset_ms", 0.0))
                 
             if new_b["state"] in ["PLAYING", "QUEUED_PLAY", "QUEUED_STOP"] and new_b["id"] not in self.clock.buffer_data:
                 self.clock._load_buffer(new_b["id"])
