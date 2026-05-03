@@ -14,7 +14,11 @@ import json
 import shutil
 import copy
 
-__version__ = "1.0.0"
+#__version__ = "1.0.0"  # first useable
+__version__ = "1.0.1"   # adding more timesignature, and remove the CLICK channel from session.json
+
+CLICK_BUFFER_ID = 99
+MAX_BUFFERS = 32
 
 # ==========================================
 # 1. SYSTEM INITIALIZATION & WORKSPACE
@@ -439,7 +443,7 @@ class AudioTool:
         self.selected_index = 0
         self.scroll_y = 0 
         self.looper_index = 0 
-        self.target_buffer_index = 0  
+        self.target_buffer_index = 1  
         
         self.running = True
         self.max_vol = 1.5
@@ -466,6 +470,9 @@ class AudioTool:
         self.pattern_sel_idx = 0
         self.current_pattern_idx = 0
         
+        # Initialize Patterns with CLICK at index 0
+        self._init_patterns()
+        
         self.last_key = None
         self.key_press_start = 0.0
         
@@ -488,11 +495,11 @@ class AudioTool:
                 "playhead_ratio": 0.0, 
                 "muted": False, 
                 "soloed": False
-            } for j in range(1, 32)]
+            } for j in range(1, MAX_BUFFERS + 1)]
 
             # Prepend the CLICK buffer
             click_buf = {
-                "id": 99, 
+                "id": CLICK_BUFFER_ID, 
                 "name": "CLICK", 
                 "state": "METRO", 
                 "length": 4, 
@@ -526,6 +533,8 @@ class AudioTool:
         elif sig == "3/4": self.clock.beats_per_measure = 3
         elif sig == "4/4": self.clock.beats_per_measure = 4
         elif sig == "8/4": self.clock.beats_per_measure = 8
+        elif sig == "16/4": self.clock.beats_per_measure = 16
+        elif sig == "32/4": self.clock.beats_per_measure = 32
         self.clock.clock_comp_ms = global_cfg.get("clock_comp_ms", 0)
         self.clock.play_metronome = global_cfg.get("play_metronome", False)
         
@@ -573,6 +582,42 @@ class AudioTool:
                 json.dump(data, f, indent=4)
         except Exception: pass
 
+    def _init_patterns(self):
+        self.patterns = []
+        for i in range(16):
+            other_bufs = [{
+                "id": j, 
+                "name": f"Buf {j:02d}", 
+                "state": "EMPTY", 
+                "length": 4, 
+                "vol": 1.0, 
+                "sync_beat": 0.0, 
+                "peak": 0.0, 
+                "recorded_bpm": 120, 
+                "offset_ms": 0.0, 
+                "offset_target_ms": 0.0, 
+                "playhead_ratio": 0.0, 
+                "muted": False, 
+                "soloed": False
+            } for j in range(1, MAX_BUFFERS + 1)]
+
+            click_buf = {
+                "id": CLICK_BUFFER_ID, 
+                "name": "CLICK", 
+                "state": "METRO", 
+                "length": 4, 
+                "vol": 0.5, 
+                "peak": 0.0, 
+                "muted": False, 
+                "soloed": False
+            }
+            
+            self.patterns.append({
+                "id": i + 1,
+                "name": f"Pattern {i+1:02d}",
+                "buffers": [click_buf] + other_bufs
+            })
+
     def _load_session(self):
         session_file = os.path.join(WORKSPACE_DIR, "session.json")
         if not os.path.exists(session_file):
@@ -595,7 +640,7 @@ class AudioTool:
                             state = "EMPTY"
                         
                         # Add this check: If it's ID 99, force the name to CLICK and state to METRO
-                        if lb["id"] == 99:
+                        if lb["id"] == CLICK_BUFFER_ID:
                             lb["name"] = "CLICK"
                             lb["state"] = "METRO"
 
@@ -607,12 +652,49 @@ class AudioTool:
                             "vol": lb.get("vol", 1.0),
                             "recorded_bpm": lb.get("recorded_bpm", 120),
                             "offset_ms": lb.get("offset_ms", 0.0),
+                            "offset_target_ms": lb.get("offset_target_ms", lb.get("offset_ms", 0.0)),
                             "sync_beat": lb.get("sync_beat", 0.0),
                             "muted": lb.get("muted", False),
                             "soloed": lb.get("soloed", False),
                             "playhead_ratio": 0.0,
                             "peak": 0.0
                         })
+                    
+                    # Ensure we have exactly MAX_BUFFERS physical buffers (indices 1 to MAX_BUFFERS)
+                    while len(p["buffers"]) < MAX_BUFFERS + 1:
+                        next_id = len(p["buffers"])
+                        p["buffers"].append({
+                            "id": next_id,
+                            "name": f"Buf {next_id:02d}",
+                            "state": "EMPTY",
+                            "length": 4,
+                            "vol": 1.0,
+                            "recorded_bpm": 120,
+                            "offset_ms": 0.0,
+                            "sync_beat": 0.0,
+                            "muted": False,
+                            "soloed": False,
+                            "playhead_ratio": 0.0,
+                            "peak": 0.0
+                        })
+                    
+                    # Ensure CLICK buffer is at index 0
+                    if not any(b.get("id") == CLICK_BUFFER_ID for b in p["buffers"]):
+                        p["buffers"].insert(0, {
+                            "id": CLICK_BUFFER_ID,
+                            "name": "CLICK",
+                            "state": "METRO",
+                            "length": 4,
+                            "vol": 0.5,
+                            "recorded_bpm": 120,
+                            "offset_ms": 0.0,
+                            "sync_beat": 0.0,
+                            "muted": False,
+                            "soloed": False,
+                            "playhead_ratio": 0.0,
+                            "peak": 0.0
+                        })
+                    
                     self.patterns.append(p)
             return data.get("global", {})
         except Exception:
@@ -632,6 +714,8 @@ class AudioTool:
         for p in self.patterns:
             pat_save = {"id": p["id"], "name": p["name"], "buffers": []}
             for b in p["buffers"]:
+                if b.get("id") == CLICK_BUFFER_ID:
+                    continue
                 buf_data = {
                     "id": b["id"],
                     "name": b["name"],
@@ -889,10 +973,14 @@ class AudioTool:
             p["buffers"][idx1], p["buffers"][idx2] = p["buffers"][idx2], p["buffers"][idx1]
 
     def draw_f4_looper(self, stdscr, h, w):
+        if not self.buffers:
+            return
         visible_rows = h - 7
-        start_idx = max(0, min(self.looper_index - visible_rows // 2, 32 - visible_rows))
+        start_idx = max(0, min(self.looper_index - visible_rows // 2, MAX_BUFFERS + 1 - visible_rows))
         
-        for i in range(start_idx, min(32, start_idx + visible_rows)):
+        for i in range(start_idx, min(MAX_BUFFERS + 1, start_idx + visible_rows)):
+            if i >= len(self.buffers):
+                break
             buf = self.buffers[i]
             row = 5 + (i - start_idx)
             is_sel = (i == self.looper_index)
@@ -925,9 +1013,10 @@ class AudioTool:
                 name_str = (self.text_input["val"] + "_").ljust(10)[:10]
             else:
                 name_str = self._get_marquee(buf["name"], 10)
-                
-            offset_str = f"{buf['offset_ms']:+04.0f}ms"
-            info_str = f"[{buf['length']:02d}B {offset_str}]"
+            
+            offset_val = buf.get("offset_ms", 0.0)
+            offset_str = f"{offset_val:+04.0f}ms"
+            info_str = f"[{buf.get('length', 4):02d}B {offset_str}]"
             
             stdscr.addstr(row, 10, f"{name_str} {info_str}: ", attr)
             stdscr.addstr(row, 36, f"[{state.center(9)}]", color)
@@ -1004,7 +1093,8 @@ class AudioTool:
             self.draw_f3_cards(stdscr, h, w)
             
         else:
-            target_text = f" TARGET BUFFER: [ {self.buffers[self.target_buffer_index]['name']} ] (Press 'b' to change target)"
+            target_idx = self.target_buffer_index if self.target_buffer_index < len(self.buffers) else 0
+            target_text = f" TARGET BUFFER: [ {self.buffers[target_idx]['name']} ] (Press 'b' to change target)"
             stdscr.addstr(4, 0, target_text[:w-1], curses.color_pair(4) | curses.A_BOLD)
             
             self.nav_list = self.get_nav_items()
@@ -1135,12 +1225,13 @@ class AudioTool:
             
             if mon.is_recording or mon.is_armed:
                 mon.stop_record()
-                # Finding by ID guarantees it works no matter what row the track is on!
                 target_buf = next((b for b in self.buffers if b["id"] == mon.armed_buffer_id), None)
                 if target_buf:
                     target_buf["state"] = "PLAYING"
             else:
                 buf = self.buffers[self.target_buffer_index]
+                if buf.get("id") == CLICK_BUFFER_ID:
+                    return  # Cannot record on CLICK buffer
                 if buf["state"] in ["PLAYING", "QUEUED_PLAY", "QUEUED_STOP", "STOPPED"]:
                     buf["state"] = "EMPTY"
                     buf["peak"] = 0.0
@@ -1152,7 +1243,7 @@ class AudioTool:
 
     def _sync_states(self):
         for buf in self.buffers:
-            if buf["id"] == 99:
+            if buf["id"] == CLICK_BUFFER_ID:
                 # If metronome is playing, make the meter jump on the beat
                 if self.clock.play_metronome and self.clock.global_playing:
                     # Brief spike on the beat
@@ -1178,6 +1269,7 @@ class AudioTool:
                             target_buf["sync_beat"] = m.sync_beat
                             target_buf["recorded_bpm"] = m.recorded_bpm
                             target_buf["offset_ms"] = float(self.latency_comp_ms)
+                            target_buf["offset_target_ms"] = float(self.latency_comp_ms)
                             
                             self.clock._load_buffer(target_buf["id"])
                         m.armed_buffer_id = None
@@ -1349,7 +1441,7 @@ class AudioTool:
                     
             elif key in [curses.KEY_ENTER, 10, 13]:
                 if self.dropdown["type"] == "buffer":
-                    self.target_buffer_index = self.dropdown["sel"]
+                    self.target_buffer_index = max(1, self.dropdown["sel"] + 1)
                     self.looper_index = self.target_buffer_index
                 elif self.dropdown["type"] == "timesig":
                     sig = self.dropdown["options"][self.dropdown["sel"]]
@@ -1360,17 +1452,25 @@ class AudioTool:
                     elif sig == "3/4": self.clock.beats_per_measure = 3
                     elif sig == "4/4": self.clock.beats_per_measure = 4
                     elif sig == "8/4": self.clock.beats_per_measure = 8
+                    elif sig == "16/4": self.clock.beats_per_measure = 16
+                    elif sig == "32/4": self.clock.beats_per_measure = 32
                 self.dropdown = None
                 
 
             elif key in [curses.KEY_PPAGE, curses.KEY_NPAGE, ord('['), ord(']')]:
                 if self.dropdown["type"] == "buffer":
-                    buf_idx = self.dropdown["sel"]
-                    if key in [curses.KEY_PPAGE, ord(']')]:
-                        self.buffers[buf_idx]["length"] = min(64, self.buffers[buf_idx]["length"] + 1)
-                    else:
-                        self.buffers[buf_idx]["length"] = max(1, self.buffers[buf_idx]["length"] - 1)
-                    self.dropdown["options"] = [f"{self.buffers[i]['name'][:10].ljust(10)} [{self.buffers[i]['state'][:5]}] ({self.buffers[i]['length']:02d} Bts)" for i in range(32)]
+                    buf_idx = self.dropdown["sel"] + 1
+                    if buf_idx < len(self.buffers):
+                        sig_beats = self.clock.beats_per_measure
+                        current_length = self.buffers[buf_idx]["length"]
+                        max_len = 64
+                        min_len = sig_beats
+                        if key in [curses.KEY_PPAGE, ord(']')]:
+                            self.buffers[buf_idx]["length"] = min(max_len, current_length + sig_beats)
+                        else:
+                            self.buffers[buf_idx]["length"] = max(min_len, current_length - sig_beats)
+                        opts = [f"{self.buffers[i]['name'][:10].ljust(10)} [{self.buffers[i]['state'][:5]}] ({self.buffers[i]['length']:02d} Bts)" for i in range(1, min(MAX_BUFFERS + 1, len(self.buffers)))]
+                        self.dropdown["options"] = opts
             elif key in [ord('q'), 27]: 
                 self.dropdown = None
             return 
@@ -1405,7 +1505,7 @@ class AudioTool:
                         b["sync_beat"] = 0.0
                         
         elif key == ord('t'):
-            opts = ["1/8", "1/4", "2/4", "3/4", "4/4", "8/4"]
+            opts = ["1/8", "1/4", "2/4", "3/4", "4/4", "8/4", "16/4", "32/4"]
             sel_idx = opts.index(self.clock.time_sig_string) if self.clock.time_sig_string in opts else 4
             self.dropdown = {
                 "type": "timesig",
@@ -1435,19 +1535,19 @@ class AudioTool:
                 self.pattern_sel_idx = self.current_pattern_idx
                 
             elif key in [ord('j'), curses.KEY_DOWN]: 
-                self.looper_index = min(31, self.looper_index + 1)
+                self.looper_index = min(MAX_BUFFERS, self.looper_index + 1)
                 self.target_buffer_index = self.looper_index
             elif key in [ord('k'), curses.KEY_UP]: 
                 self.looper_index = max(0, self.looper_index - 1)
                 self.target_buffer_index = self.looper_index
             
             elif key in [ord('J'), curses.KEY_SF]:
-                if self.looper_index < 31:
+                if self.looper_index < MAX_BUFFERS and self.looper_index != 0:
                     self._swap_buffers(self.looper_index, self.looper_index + 1)
                     self.looper_index += 1
                     self.target_buffer_index = self.looper_index
             elif key in [ord('K'), curses.KEY_SR]:
-                if self.looper_index > 0:
+                if self.looper_index > 1:
                     self._swap_buffers(self.looper_index, self.looper_index - 1)
                     self.looper_index -= 1
                     self.target_buffer_index = self.looper_index
@@ -1457,10 +1557,8 @@ class AudioTool:
                 step = 0.05 if key in [ord('l'), curses.KEY_RIGHT] else -0.05
                 buf["vol"] = max(0.0, min(self.max_vol, buf["vol"] + step))
                 
-                # If this is the Click track, sync the value to the clock
-                if buf["id"] == 99:
+                if buf["id"] == CLICK_BUFFER_ID:
                     self.clock.metro_vol = buf["vol"]
-                    # Also toggle the metronome on if the volume is raised
                     self.clock.play_metronome = (buf["vol"] > 0) and not buf.get("muted", False)
 
 
@@ -1519,10 +1617,12 @@ class AudioTool:
                 
             elif key in [curses.KEY_PPAGE, ord(']'), ord('}')]:
                 buf = self.buffers[self.looper_index]
-                buf["length"] = min(64, buf["length"] + 1)
+                sig_beats = self.clock.beats_per_measure
+                buf["length"] = min(64, buf["length"] + sig_beats)
             elif key in [curses.KEY_NPAGE, ord('['), ord('{')]:
                 buf = self.buffers[self.looper_index]
-                buf["length"] = max(1, buf["length"] - 1)
+                sig_beats = self.clock.beats_per_measure
+                buf["length"] = max(sig_beats, buf["length"] - sig_beats)
                 
             elif key in [ord('<'), ord(',')]:
                 buf = self.buffers[self.looper_index]
@@ -1591,12 +1691,12 @@ class AudioTool:
             elif key in [ord('k'), curses.KEY_UP]: self.selected_index -= 1
             
             elif key == ord('b'):
-                opts = [f"{self.buffers[i]['name'][:10].ljust(10)} [{self.buffers[i]['state'][:5]}] ({self.buffers[i]['length']:02d} Bts)" for i in range(32)]
+                opts = [f"{self.buffers[i]['name'][:10].ljust(10)} [{self.buffers[i]['state'][:5]}] ({self.buffers[i]['length']:02d} Bts)" for i in range(1, min(MAX_BUFFERS + 1, len(self.buffers)))]
                 self.dropdown = {
                     "type": "buffer",
                     "title": "Select Target Buffer (PgUp/PgDn to change beats)",
                     "options": opts,
-                    "sel": self.target_buffer_index
+                    "sel": max(0, min(self.target_buffer_index - 1, len(opts) - 1))
                 }
                 
             elif key in [curses.KEY_ENTER, 10, 13]:
